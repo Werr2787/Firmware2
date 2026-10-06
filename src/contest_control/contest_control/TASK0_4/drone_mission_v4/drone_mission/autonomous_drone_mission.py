@@ -776,10 +776,27 @@ class RoomExplorer:
             return
         if self.fc.tilt > MAX_TILT_FOR_MAP:
             return
+        prev_xy = self.mapper.last_pose_xy
+        prev_yaw = self.mapper.last_yaw
         self.mapper.integrate(msg.ranges, msg.angle_min, msg.angle_increment,
                               msg.range_min, msg.range_max,
                               self.fc.current_pos[0], self.fc.current_pos[1],
                               self.fc.current_yaw)
+        # ── защита карты от «смешивания» при разворотах дрона ──
+        # LidarMapper._stabilize_yaw доворачивает сканы, полученные во время
+        # вращения на месте (позиция та же, yaw меняется), к прежнему
+        # стабильному yaw — стены комнаты остаются на своих местах, и в окне
+        # 'lidar_map' карта больше не перерисовывается «винтом» при каждом
+        # развороте. Здесь дополнительно: если дрон НЕ перемещался между
+        # сканами, трекер движения mapper'а не обновляем, чтобы фаза осмотра
+        # (GO_VIEWPOINT / SHAPE_SCAN) продолжала лететь по прежнему плану и
+        # не получала каждый цикл новую «мнимую» геометрию.
+        moved = (prev_xy is None or
+                 math.hypot(self.fc.current_pos[0] - prev_xy[0],
+                            self.fc.current_pos[1] - prev_xy[1]) >= 0.15)
+        if not moved and prev_yaw is not None:
+            self.mapper.last_pose_xy = prev_xy   # держим «дрон стоит на месте»
+            self.mapper.last_yaw = self.fc.current_yaw
 
     def _get_front_range(self) -> float:
         """Минимальная дальность лидара вперёд (±15°)."""
@@ -803,6 +820,7 @@ class RoomExplorer:
         self.target_vp = None
         self.qr_hold_until = 0.0
         self.reset_nav()
+        self.mapper.reset_motion_state()   # новая комната — трекер вращения заново
         self.is_scanning = True
         self.scan_complete = False
         self.hold_xy = (self.fc.current_pos[0], self.fc.current_pos[1])

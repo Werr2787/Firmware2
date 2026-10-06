@@ -63,6 +63,7 @@ from qr_stream import CameraWorker, FrameJob
 # ──────────────────────────────────────────────
 
 NS = '/uav1'                       # namespace дрона
+WAIT_TIMEOUT = 60.0                # макс. время ожидания state/pose/scan в фазе WAIT, с
 SCAN_ALT = 2.0                     # высота сканирования над точкой старта, м
 MOVE_SPEED = 0.6                   # скорость подъёма, м/с
 SP_RATE_HZ = 20                    # частота публикации setpoint, Гц
@@ -1322,8 +1323,38 @@ class MissionStateMachine:
                 self.land_descend_z = self.fc.scan_z
                 self.set_phase(MissionPhase.PRESTREAM)
             else:
-                self.node.get_logger().info(
-                    'Жду MAVROS, pose и лидар...', throttle_duration_sec=2.0)
+                now = time.monotonic()
+                if not hasattr(self, '_wait_since'):
+                    self._wait_since = now
+                    self._last_wait_log = 0.0
+                missing = []
+                if not self.fc.is_connected():
+                    missing.append('state(/uav1/mavros/state — нет сообщения или connected=False)')
+                if self.fc.pose is None:
+                    missing.append('pose(/uav1/mavros/local_position/pose)')
+                if self.explorer.scan is None:
+                    missing.append('scan(/uav1/scan)')
+                elapsed = now - self._wait_since
+                # Подробная диагностика раз в ~10 с, чтобы было видно, ЧЕГО именно нет
+                if (now - self._last_wait_log > 10.0
+                        or int(elapsed) in (30, 60, 120)):
+                    self._last_wait_log = now
+                    self.node.get_logger().warn(
+                        f'[WAIT] Не хватает {len(missing)} из 3 входов: '
+                        + '; '.join(missing) +
+                        f' | жду уже {elapsed:.0f} с. Проверьте: запущен ли mavros_node,'
+                        f' namespace {NS}, QoS BEST_EFFORT на state/pose/scan,'
+                        f' совпадает ли NS с реальным топиком (ros2 topic list)')
+                else:
+                    self.node.get_logger().info(
+                        'Жду MAVROS, pose и лидар...', throttle_duration_sec=2.0)
+                # Долгий ожидание = проблема конфигурации, а не случайная задержка
+                if elapsed > WAIT_TIMEOUT:
+                    self.node.get_logger().error(
+                        f'[WAIT] Таймаут ожидания сенсоров ({WAIT_TIMEOUT:.0f} с).'
+                        ' Миссия не может начаться: проверьте mavros/лидар/namespace.'
+                        ' Узел продолжает ждать (Ctrl+C для выхода).')
+                    self._wait_since = now  # не спамим ошибкой каждую секунду
             return
 
         # ── PRESTREAM ──

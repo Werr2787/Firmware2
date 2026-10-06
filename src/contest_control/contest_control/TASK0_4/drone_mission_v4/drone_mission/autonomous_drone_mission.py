@@ -314,6 +314,9 @@ class QrDetector:
         self.generation = 0
         self.received_at = {'down': 0.0, 'front': 0.0}
         self.processed = {'down': 0, 'front': 0}
+        # Время (monotonic) последнего обработанного результата по камерам —
+        # для диагностики: кадры могут приходить, но обрабатываться с задержкой.
+        self.processed_at = {'down': 0.0, 'front': 0.0}
         self.decode_ms = {'down': 0.0, 'front': 0.0}
         self._candidate_jobs = {}
         self._candidate_sequences = {}
@@ -396,6 +399,7 @@ class QrDetector:
                 break
             name, job = result.camera, result.job
             self.processed[name] += 1
+            self.processed_at[name] = now
             self.decode_ms[name] = result.elapsed * 1000.0
             if job.generation != self.generation or now - job.captured_at > QR_RESULT_MAX_AGE:
                 continue
@@ -1693,15 +1697,32 @@ class DroneMissionNode(Node):
     def _camera_diagnostics(self):
         now = time.monotonic()
         for name in ('down', 'front'):
+            worker = self.qr.workers[name]
             received = self.qr.received_at[name]
-            age = now - received if received else float('inf')
+            # Возраст считается по последнему ОБРАБОТАННОМУ кадру: пока worker
+            # ещё декодирует предыдущий кадр, новые кадры уже принимаются.
+            processed_age = (now - self.qr.processed_at[name]
+                             if self.qr.processed_at[name] else float('inf'))
+            rx_age = now - received if received else float('inf')
+            pending = worker.pending.qsize() + worker.inflight
             self.get_logger().info(
                 f'[CAM/{name}] rx={self.qr.nframes[name]} '
                 f'processed={self.qr.processed[name]} decode={self.qr.decode_ms[name]:.0f}ms '
-                f'age={age:.2f}s replaced={self.qr.workers[name].dropped}')
-            if age > 1.0:
+                f'age={processed_age:.2f}s replaced={worker.dropped} pending={pending}')
+            
+            # Проверяем здоровье конвейера по возрaсту ОБРАБОТКИ, а не получения.
+            # Если кадры приходят, но не обрабатываются — это проблема с CPU/decoder.
+            # Если кадры вообще не приходят — проблема с topic/bridge/QoS.
+            if rx_age > 3.0 and processed_age > 3.0:
+                # Длительное отсутствие кадров на входе И в обработке.
                 self.get_logger().warn(
                     f'[CAM/{name}] Нет свежих кадров: проверьте camera topic/bridge/QoS')
+            elif processed_age > max(2.5, 4.0 * self.qr.decode_ms[name] / 1000.0):
+                # Кадры приходят регулярно, но конвейер не успевает их обрабатывать.
+                self.get_logger().warn(
+                    f'[CAM/{name}] Конвейер QR отстаёт: decode='
+                    f'{self.qr.decode_ms[name]:.0f}ms при rx_age={rx_age:.2f}s; '
+                    f'проверьте загрузку CPU / уменьшите разрешение камеры')
 
     def _show_lidar(self):
         """Отдельное окно: карта лидара, стены, углы, проёмы, точки осмотра."""
@@ -1742,13 +1763,28 @@ def main():
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Прерывание пользователем')
-        node.fc.land()
-        rclpy.spin_once(node, timeout_sec=0.5)
+        # При Ctrl+C контекст может быть уже невалидным для публикации логов.
+        # Используем print вместо logger, чтобы избежать ошибки.
+        print('[drone_mission] Прерывание пользователем (Ctrl+C)')
+        try:
+            node.fc.land()
+        except Exception as e:
+            print(f'[drone_mission] Ошибка при посадке: {e}')
+        # Даем немного времени на обработку последних setpoint'ов
+        try:
+            rclpy.spin_once(node, timeout_sec=0.3)
+        except Exception:
+            pass
     finally:
-        node.shutdown()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            node.shutdown()
+        except Exception as e:
+            print(f'[drone_mission] Ошибка при shutdown: {e}')
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

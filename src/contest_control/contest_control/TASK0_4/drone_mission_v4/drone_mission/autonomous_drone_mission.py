@@ -77,7 +77,7 @@ YAW_DWELL = 0.6                   # время удержания на кажд�
 WAYPOINT_REACHED_DWELL = 0.3      # пауза после достижения waypoint, с
 
 # QR дебаунс
-QR_CONFIRM_COUNT = 1             # два разных кадра для подтверждения QR
+QR_CONFIRM_COUNT = 2             # число разных кадров для подтверждения QR
 QR_CONFIRM_WINDOW = 3.0           # окно времени для подтверждения, с
 QR_RESULT_MAX_AGE = 1.5           # старые результаты не управляют полётом
 QR_HOLD_TIME = 1.5                # зависание для чтения контура QR на полу
@@ -1087,6 +1087,8 @@ class MissionStateMachine:
         self.door_pass_start: float = 0.0
         self.door_hover_start: float = 0.0
         self.room_qr_reset_at_crossing = False
+        # Время зависания после пролёта двери, с (можно уменьшить в тестах)
+        self.hover_after_door: float = HOVER_AFTER_DOOR
 
         # LAND_ON_PLATFORM (visual servoing)
         self.land_descend_z: float = 0.0
@@ -1549,7 +1551,7 @@ class MissionStateMachine:
                     f'{self.room_center[1]:.1f})')
 
             # Зависание после пролёта (отсчёт от момента commit)
-            if self.door_path_committed and now - self.door_hover_start > HOVER_AFTER_DOOR:
+            if self.door_path_committed and now - self.door_hover_start > self.hover_after_door:
                 self.set_phase(MissionPhase.VERIFY_NEW_ROOM)
             return
 

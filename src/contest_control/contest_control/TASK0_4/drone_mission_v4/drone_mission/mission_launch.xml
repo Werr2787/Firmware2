@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<launch>
+  <!--
+    Launch file for autonomous drone mission.
+    Assumes MAVROS is already running and connected to PX4 in Gazebo.
+
+    Usage:
+      ros2 launch drone_mission mission_launch.py
+
+    Prerequisites:
+      1. Gazebo simulation running with PX4
+      2. MAVROS node running: ros2 run mavros mavros_node fcu_url:=udp://:14540@...
+      3. Camera topics published: /uav1/camera_down, /uav1/camera
+      4. Lidar topic: /uav1/scan
+  -->
+
+  <node name="drone_mission" pkg="drone_mission" exec="autonomous_drone_mission"
+        output="screen" />
+</launch>

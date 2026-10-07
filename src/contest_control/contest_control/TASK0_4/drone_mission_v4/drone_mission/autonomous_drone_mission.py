@@ -49,7 +49,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import (QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
-                       qos_profile_sensor_data)
+                       QoSHistoryPolicy, qos_profile_sensor_data)
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image, Imu, LaserScan, Range
 from mavros_msgs.msg import State
@@ -608,10 +608,47 @@ class FlightController:
     """
     Управление полётом через MAVROS: публикация setpoint'ов,
     переключение режимов, arm/disarm.
+
+    Устойчивость к QoS-несоответствиям: в разных сборках PX4+MAVROS топики
+    state/local_position публикуются с BEST_EFFORT (compat/sensor data), а в
+    других — с RELIABLE. Подписка с несовместимым профилем молча не получает
+    сообщений (это и было причиной «Жду MAVROS, pose и лидар...» при живых
+    камерах). Поэтому для каждого топика держим ДВЕ подписки — RELIABLE и
+    BEST_EFFORT: ROS2 допускает подписчика, совместимого хотя бы с одним
+    профилем издатели, кадры приходят всегда. При отсутствии данных узел
+    дополнительно печатает реальные профили издателей (ros2 topic info -v).
+
+    Авто-перебор имён топиков (PoseLink): mavros_node может запускаться без
+    namespace'а (/mavros/state вместо /uav1/mavros/state), с другим префиксом
+    (/uas1/..., /drone/...) или вообще на другом пути. Если издателя нет ни на
+    одном кандидате, подписка молчит вечно. PoseLink раз в несколько секунд
+    проверяет count_publishers по списку кандидатов и пересоздаёт подписки на
+    тот топик, где издатель реально существует; имена можно дополнить
+    параметрами узла (см. DroneMissionNode).
     """
 
-    def __init__(self, node: Node):
+    # Кандидаты перебираются попарно (state+pose); первый, у которого есть
+    # издатели, фиксируется как рабочий.
+    STATE_POSE_CANDIDATES = [
+        ('/uav1/mavros/state', '/uav1/mavros/local_position/pose'),
+        ('/mavros/state', '/mavros/local_position/pose'),
+        ('/uas1/mavros/state', '/uas1/mavros/local_position/pose'),
+        ('/drone/mavros/state', '/drone/mavros/local_position/pose'),
+        ('/uav/mavros/state', '/uav/mavros/local_position/pose'),
+    ]
+
+    def __init__(self, node: Node, extra_candidates=None):
         self.node = node
+        self.state_topic = f'{NS}/mavros/state'
+        self.pose_topic = f'{NS}/mavros/local_position/pose'
+        self._cand_idx = 0
+        self._lockin = 0            # сколько циклов подряд виден издатель на текущем топике
+        self._switches = 0          # сколько раз уже переезжали на другой кандидат
+        self._scan_log_at = 0.0
+        if extra_candidates:
+            # Пользовательские пары (state, pose) имеют приоритет над стандартными
+            self.STATE_POSE_CANDIDATES = list(extra_candidates) + \
+                self.STATE_POSE_CANDIDATES
         self.pub = node.create_publisher(
             PoseStamped, f'{NS}/mavros/setpoint_position/local', 10)
         self.cli_mode = node.create_client(SetMode, f'{NS}/mavros/set_mode')
@@ -631,11 +668,87 @@ class FlightController:
         # Высота сканирования (абсолютная)
         self.scan_z: float = SCAN_ALT
 
+        # Диагностика входящих сообщений (для WAIT-логов)
+        self.last_state_at: float = 0.0
+        self.last_pose_at: float = 0.0
+        self._state_rx = 0
+        self._pose_rx = 0
+
+    # ── PoseLink: авто-перебор имён mavros-топиков ──────────────
+    def attach_subscriptions(self, subs_map):
+        """Регистрирует подписки узла для пересоздания при смене топика."""
+        self._mav_subs = subs_map   # {'state': [sub_be, sub_rel], 'pose': [...]}
+
+    def _publishers_here(self):
+        try:
+            ns_p = self.node.count_publishers(self.state_topic)
+            ps_p = self.node.count_publishers(self.pose_topic)
+        except Exception:
+            return -1, -1
+        return ns_p, ps_p
+
+    def rescan_topics(self):
+        """Вызывается таймером: если на текущих state/pose нет издателей,
+        переходим к следующему кандидату из списка. При появлении издателя
+        на новом топике — пересоздаём подписки и фиксируем выбор."""
+        if getattr(self, '_mav_subs', None) is None:
+            return
+        n_state, n_pose = self._publishers_here()
+        if n_state > 0 or n_pose > 0:
+            self._lockin += 1
+            if self._lockin >= 2:      # данные подтверждены — стоп-поиск
+                return
+        now = time.monotonic()
+        if now - self._scan_log_at > 10.0:
+            self._scan_log_at = now
+            cands = ', '.join(s for s, _ in self.STATE_POSE_CANDIDATES)
+            self.node.get_logger().warn(
+                f'[MAV] На {self.state_topic} publishers={max(n_state,0)}, '
+                f'на {self.pose_topic} publishers={max(n_pose,0)} — '
+                f'mavros_node не запущен или топики названы иначе. '
+                f'Кандидаты: [{cands}]. '
+                f'Проверьте: ros2 topic list | grep mavros')
+        if self._switches >= len(self.STATE_POSE_CANDIDATES) * 3:
+            return                     # исчерпали разумный число переездов
+        old_state, old_pose = self.state_topic, self.pose_topic
+        self._cand_idx = (self._cand_idx + 1) % len(self.STATE_POSE_CANDIDATES)
+        self._switches += 1
+        self.state_topic, self.pose_topic = self.STATE_POSE_CANDIDATES[self._cand_idx]
+        if (self.state_topic, self.pose_topic) == (old_state, old_pose):
+            return
+        self._lockin = 0
+        self.node.get_logger().info(
+            f'[MAV] Пробую другой кандидат топиков: '
+            f'{self.state_topic} / {self.pose_topic}')
+
+    def rebind_subscriptions(self, make_sub_fn):
+        """Уничтожает старые подписки state/pose и создаёт новые на текущие
+        имена через make_sub_fn(topic, cb, kind) -> [sub_be, sub_rel]."""
+        subs = getattr(self, '_mav_subs', None)
+        if subs is None:
+            return
+        for key in ('state', 'pose'):
+            for s in subs.get(key, []):
+                try:
+                    self.node.destroy_subscription(s)
+                except Exception:
+                    pass
+        cb_state = self.on_state
+        cb_pose = self.on_pose
+        subs['state'] = make_sub_fn(self.state_topic, cb_state, State)
+        subs['pose'] = make_sub_fn(self.pose_topic, cb_pose, PoseStamped)
+        self.node.get_logger().info(
+            f'[MAV] Подписки пересозданы: {self.state_topic}, {self.pose_topic}')
+
     def on_state(self, msg: State):
         self.state = msg
+        self._state_rx += 1
+        self.last_state_at = time.monotonic()
 
     def on_pose(self, msg: PoseStamped):
         self.pose = msg
+        self._pose_rx += 1
+        self.last_pose_at = time.monotonic()
         p = msg.pose.position
         self.current_pos = (p.x, p.y, p.z)
         o = msg.pose.orientation
@@ -755,6 +868,7 @@ class RoomExplorer:
         self.fc = fc
         self.qr = qr
         self.scan: Optional[LaserScan] = None
+        self.last_scan_at: float = 0.0
         self.mapper = LidarMapper(origin_xy=(0.0, 0.0))
 
         self.room_center: Tuple[float, float] = (0.0, 0.0)
@@ -790,6 +904,7 @@ class RoomExplorer:
     # ── лидар ──
     def on_scan(self, msg: LaserScan):
         self.scan = msg
+        self.last_scan_at = time.monotonic()
         if self.fc.pose is None:
             return
         # не рисуем карту на земле и при сильном крене (лидар «видит» пол)
@@ -1370,9 +1485,9 @@ class MissionStateMachine:
                     self._last_wait_log = 0.0
                 missing = []
                 if not self.fc.is_connected():
-                    missing.append('state(/uav1/mavros/state — нет сообщения или connected=False)')
+                    missing.append(f'state({self.fc.state_topic} — нет сообщения или connected=False)')
                 if self.fc.pose is None:
-                    missing.append('pose(/uav1/mavros/local_position/pose)')
+                    missing.append(f'pose({self.fc.pose_topic})')
                 if self.explorer.scan is None:
                     missing.append('scan(/uav1/scan)')
                 elapsed = now - self._wait_since
@@ -1380,12 +1495,24 @@ class MissionStateMachine:
                 if (now - self._last_wait_log > 10.0
                         or int(elapsed) in (30, 60, 120)):
                     self._last_wait_log = now
+                    pub_info = []
+                    for t in (self.fc.state_topic,
+                              self.fc.pose_topic,
+                              f'{NS}/scan'):
+                        try:
+                            n = self.node.count_publishers(t)
+                        except Exception:
+                            n = -1
+                        pub_info.append(f'{t}: publishers={n}')
+                    rx = (f'rx(state={self.fc._state_rx}, '
+                          f'pose={self.fc._pose_rx})')
                     self.node.get_logger().warn(
                         f'[WAIT] Не хватает {len(missing)} из 3 входов: '
                         + '; '.join(missing) +
-                        f' | жду уже {elapsed:.0f} с. Проверьте: запущен ли mavros_node,'
-                        f' namespace {NS}, QoS BEST_EFFORT на state/pose/scan,'
-                        f' совпадает ли NS с реальным топиком (ros2 topic list)')
+                        f' | жду уже {elapsed:.0f} с | {rx} | '
+                        + ' | '.join(pub_info) +
+                        ' | Если publishers>0, но rx=0 — несовпадение QoS или NS;'
+                        ' проверьте `ros2 topic info <топик> -v` и запущен ли mavros_node')
                 else:
                     self.node.get_logger().info(
                         'Жду MAVROS, pose и лидар...', throttle_duration_sec=2.0)
@@ -1844,18 +1971,48 @@ class DroneMissionNode(Node):
         super().__init__('drone_mission')
         q = qos_profile_sensor_data
 
-        self.fc = FlightController(self)
+        # Параметры: доп. кандидаты имён mavros-топиков (если у вас другой NS)
+        self.declare_parameter('mav_state_topic', '')
+        self.declare_parameter('mav_pose_topic', '')
+        extra = []
+        st = self.get_parameter('mav_state_topic').value or ''
+        pt = self.get_parameter('mav_pose_topic').value or ''
+        if st and pt:
+            extra.append((st, pt))
+
+        self.fc = FlightController(self, extra_candidates=extra)
         self.qr = QrDetector(self)
         self.explorer = RoomExplorer(self, self.fc, self.qr)
         self.mission = MissionStateMachine(self, self.fc, self.qr, self.explorer)
 
-        # Подписки
-        self.create_subscription(State, f'{NS}/mavros/state',
-                                 self.fc.on_state, q)
-        self.create_subscription(PoseStamped, f'{NS}/mavros/local_position/pose',
-                                 self.fc.on_pose, q)
-        self.create_subscription(LaserScan, f'{NS}/scan',
-                                 self.explorer.on_scan, q)
+        # Подписки: для state/pose/scan держим по ДВЕ подписки — RELIABLE и
+        # BEST_EFFORT. В ROS2 несовместимый по reliability подписчик молча не
+        # получает ничего; сдвоенные подписки гарантируют, что хотя бы одна
+        # из них сойдётся с профилем издателя (PX4-MAVROS публикует эти топики
+        # с BEST_EFFORT, ros_gz-лидары — часто с RELIABLE). Callback'ы идемпотентны.
+        be = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                        durability=QoSDurabilityPolicy.VOLATILE,
+                        history=QoSHistoryPolicy.KEEP_LAST)
+        rel = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.RELIABLE,
+                         durability=QoSDurabilityPolicy.VOLATILE,
+                         history=QoSHistoryPolicy.KEEP_LAST)
+
+        def make_dual(topic, cb, kind):
+            return [self.create_subscription(kind, topic, cb, be),
+                    self.create_subscription(kind, topic, cb, rel)]
+
+        self.mav_qos_subs = []
+        subs_map = {}
+        for key, topic, cb, kind in (
+                ('state', self.fc.state_topic, self.fc.on_state, State),
+                ('pose', self.fc.pose_topic, self.fc.on_pose, PoseStamped)):
+            subs_map[key] = make_dual(topic, cb, kind)
+            self.mav_qos_subs.extend(subs_map[key])
+        # Лидар остаётся на фиксированном топике (ros_gz публикует его напрямую)
+        scan_subs = make_dual(f'{NS}/scan', self.explorer.on_scan, LaserScan)
+        self.mav_qos_subs.extend(scan_subs)
+        self.fc.attach_subscriptions(subs_map)
+        self._make_mav_sub = make_dual
         self.create_subscription(Range, f'{NS}/rangefinder',
                                  self._on_rangefinder, q)
         self.create_subscription(Imu, f'{NS}/mavros/imu/data',
@@ -1878,12 +2035,26 @@ class DroneMissionNode(Node):
             self.create_timer(0.1, self._show_cameras)
         self.create_timer(2.0, self._camera_diagnostics)
         self.create_timer(CAM_RECONNECT_PERIOD, self.camera_link.update)
+        # PoseLink: раз в 4 с проверяем, есть ли издатели на текущих mavros-
+        # топиках; при отсутствии перебираем кандидатов и пересоздаём подписки.
+        self.create_timer(4.0, self._mav_topic_watchdog)
 
         self.get_logger().info(
             'DroneMissionNode запущен. Ожидание MAVROS...')
 
     def _on_rangefinder(self, msg: Range):
         self.rangefinder = msg
+
+    def _mav_topic_watchdog(self):
+        """PoseLink watchdog: если state/pose не приходят — ищем реальные
+        имена mavros-топиков среди кандидатов и переподписываемся."""
+        if self.fc.state is not None or self.fc.pose is not None:
+            return                     # данные уже идут — ничего не делаем
+        before = (self.fc.state_topic, self.fc.pose_topic)
+        self.fc.rescan_topics()
+        after = (self.fc.state_topic, self.fc.pose_topic)
+        if after != before:
+            self.fc.rebind_subscriptions(self._make_mav_sub)
 
     def _on_imu(self, msg: Imu):
         self.imu = msg

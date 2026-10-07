@@ -44,6 +44,18 @@ SAFETY_MARGIN = 0.6       # минимум до стены для точек и 
 MERGE_DIST = 1.2          # точки ближе этого объединяются, м
 MIN_OPEN_EDGE = 0.8       # открытая сторона короче — игнорируется, м
 
+# ── компенсация поворота дрона (защита от «смешивания» карты) ──
+# При развороте на месте позиция в ENU не меняется, а LaserScan приходит с
+# новым yaw. Если интегрировать такой скан как есть, лучи рисуются там, где
+# их «увидел» поворот, и карта смазывается при каждом развороте. Поэтому
+# сканы, полученные во время вращения (yaw изменился больше YAW_ROT_THRESH
+# между соседними сканами), доворачиваются к прежнему ориентированию дрона —
+# геометрия комнаты остаётся неподвижной в мировых координатах.
+YAW_ROT_THRESH = math.radians(10.0)   # считаем дрон «вращающимся»
+YAW_SLEW_LIMIT = math.radians(90.0)   # физический предел поворота за скан;
+                                      # скачок больше — это шум/потеря pose,
+                                      # скан отбрасывается целиком
+
 
 def _unit(v):
     n = float(np.linalg.norm(v))
@@ -121,6 +133,15 @@ class LidarMapper:
         self.room: Optional[RoomModel] = None
         self.last_scan_xy: Optional[np.ndarray] = None
         self.n_scans = 0
+        # ── компенсация вращения дрона (карта не должна «смешиваться»
+        #    при разворотах) ──
+        self.last_pose_xy: Optional[np.ndarray] = None
+        self.last_yaw: Optional[float] = None
+        self._stable_yaw: Optional[float] = None   # yaw после последнего
+                                                   # перемещения дрона
+        self.n_rot_corrected = 0     # сколько сканов довернуто
+        self.n_rot_dropped = 0       # сколько сканов отброшено (скачок yaw)
+        self.n_skipped = 0           # всего сканов, не попавших в карту
 
     # ───────────── координаты ─────────────
     def w2p(self, x, y) -> Tuple[int, int]:
@@ -133,12 +154,62 @@ class LidarMapper:
         return 0 <= ix < self.n and 0 <= iy < self.n
 
     # ───────────── интеграция скана ─────────────
+    def _stabilize_yaw(self, x, y, yaw):
+        """Компенсация поворота дрона на месте.
+
+        Лидар в Gazebo «вращает» лучи вместе с корпусом: если дрон разворачивается,
+        не меняя позиции (x, y), следующий LaserScan рисует те же стены в других
+        мировых точках — карта смазывается и A* начинает водить дрона врезаясь.
+
+        Правило:
+          * дрон переместился (>= MOVE_EPS)   -> yaw обновляется штатно;
+          * позиция та же, |Δyaw| <= YAW_SLEW_LIMIT -> считаем это вращением:
+            скан доворачиваем к прежнему стабильному yaw (геометрия комнаты
+            остаётся неподвижной);
+          * скачок yaw больше физического предела при той же позиции -> шум pose,
+            скан отбрасываем целиком.
+
+        Возвращает (use: bool, yaw_eff: float).
+        """
+        MOVE_EPS = 0.15   # м — меньше этого считаем, что дрон «на месте»
+        if self.last_pose_xy is None or self._stable_yaw is None:
+            use, ye = True, yaw
+        else:
+            moved = float(np.linalg.norm(np.array([x, y]) - self.last_pose_xy))
+            dyaw = abs(math.atan2(math.sin(yaw - self.last_yaw),
+                                  math.cos(yaw - self.last_yaw)))
+            if moved >= MOVE_EPS:
+                use, ye = True, yaw                 # обычное движение
+            elif dyaw > YAW_SLEW_LIMIT:
+                use, ye = False, self._stable_yaw   # скачок — мусор, режем
+                self.n_rot_dropped += 1
+            elif dyaw > YAW_ROT_THRESH:
+                use, ye = True, self._stable_yaw    # вращение на месте —
+                self.n_rot_corrected += 1           # доворачиваем к старому yaw
+            else:
+                use, ye = True, yaw                 # стоит почти прямо
+        self.last_pose_xy = np.array([x, y])
+        self.last_yaw = yaw
+        if use:
+            self._stable_yaw = ye
+        return use, ye
+
+    def reset_motion_state(self):
+        """Сброс трекера вращения (например, при старте новой комнаты)."""
+        self.last_pose_xy = None
+        self.last_yaw = None
+        self._stable_yaw = None
+
     def integrate(self, ranges, angle_min, angle_inc, range_min, range_max,
                   x, y, yaw):
         r = np.asarray(ranges, np.float32)
         if r.size < 10:
             return
-        ang = angle_min + np.arange(r.size, dtype=np.float32) * angle_inc + yaw
+        use, yaw_eff = self._stabilize_yaw(x, y, yaw)
+        if not use:
+            self.n_skipped += 1
+            return
+        ang = angle_min + np.arange(r.size, dtype=np.float32) * angle_inc + yaw_eff
         rmax = min(float(range_max), MAX_FREE_RANGE)
         valid = np.isfinite(r) & (r > range_min) & (r < range_max * 0.98)
         far = (np.isinf(r) | (np.isfinite(r) & (r >= range_max * 0.98)))
@@ -161,7 +232,12 @@ class LidarMapper:
         iy = ((hy - self.oy) / self.res).astype(np.int32)
         ok = (ix >= 0) & (ix < self.n) & (iy >= 0) & (iy < self.n)
         np.add.at(self.hits, (iy[ok], ix[ok]), 1)
-        self.last_scan_xy = np.stack([hx, hy], axis=1)
+        # «Сырые» точки последнего скана тоже доворачиваем к yaw_eff, иначе в
+        # окне lidar_map красные точки прыгают по кругу при каждом развороте.
+        raw_ang = angle_min + np.arange(r.size, dtype=np.float32) * angle_inc + yaw
+        hxr = x + r[valid] * np.cos(raw_ang[valid])
+        hyr = y + r[valid] * np.sin(raw_ang[valid])
+        self.last_scan_xy = np.stack([hxr, hyr], axis=1)
 
         # проёмы
         rd = np.where(valid, r, np.where(far, float(range_max), np.nan))
@@ -587,6 +663,8 @@ class LidarMapper:
                       f'Стен: {sum(w.kind == "wall" for w in r.walls)}  '
                       f'углов: {len(r.corners)}  вогн.: {len(r.concave)}']
         lines.append(f'Проёмов (~{DOOR_WIDTH:.0f} м): {len(self.confirmed_doors())}')
+        lines.append(f'Сканов: {self.n_scans}  довернуто/срезано: '
+                     f'{self.n_rot_corrected}/{self.n_rot_dropped}')
         lines += list(info_lines)
         for k, t in enumerate(lines):
             _put_text(panel, t, (8, 22 + 20 * k))

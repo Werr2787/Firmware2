@@ -48,7 +48,8 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
+                       qos_profile_sensor_data)
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image, Imu, LaserScan, Range
 from mavros_msgs.msg import State
@@ -63,6 +64,7 @@ from qr_stream import CameraWorker, FrameJob
 # ──────────────────────────────────────────────
 
 NS = '/uav1'                       # namespace дрона
+WAIT_TIMEOUT = 60.0                # макс. время ожидания state/pose/scan в фазе WAIT, с
 SCAN_ALT = 2.0                     # высота сканирования над точкой старта, м
 MOVE_SPEED = 0.6                   # скорость подъёма, м/с
 SP_RATE_HZ = 20                    # частота публикации setpoint, Гц
@@ -76,7 +78,7 @@ YAW_DWELL = 0.6                   # время удержания на кажд�
 WAYPOINT_REACHED_DWELL = 0.3      # пауза после достижения waypoint, с
 
 # QR дебаунс
-QR_CONFIRM_COUNT = 1             # два разных кадра для подтверждения QR
+QR_CONFIRM_COUNT = 2             # число разных кадров для подтверждения QR
 QR_CONFIRM_WINDOW = 3.0           # окно времени для подтверждения, с
 QR_RESULT_MAX_AGE = 1.5           # старые результаты не управляют полётом
 QR_HOLD_TIME = 1.5                # зависание для чтения контура QR на полу
@@ -108,6 +110,23 @@ FORCE_ARM = True                 # принудительный arm для си�
 
 # Безопасность
 SAFETY_MARGIN = 0.5              # минимальное расстояние до препятствия при движении, м
+
+# Камеры (см. диагностику [CAM/...]): ros_gz_bridge публикует кадры с
+# RELIABLE/VOLATILE QoS; подписка на sensor-data (BEST_EFFORT) совместима не со
+# всеми сборками Fast DDS — кадры могут вообще не приходить (rx=0). Поэтому для
+# камер используется отдельный надёжный профиль, а при отсутствии кадров узел
+# автоматически пробует альтернативные профили и имена топиков.
+CAMERA_QOS_DEPTH = 2             # глубина очереди подписки на камеры
+CAMERA_TOPICS = {                # имя камеры -> список кандидатов топиков (по приоритету)
+    'down': (f'{NS}/camera_down', f'{NS}/camera_down/image_raw',
+             f'{NS}/mono_cam_down/image_raw', '/camera_down'),
+    'front': (f'{NS}/camera', f'{NS}/camera/image_raw',
+              f'{NS}/mono_cam/image_raw', '/camera'),
+}
+CAMERA_QOS_PROFILES = ('reliable', 'sensor', 'reliable_transient')
+CAM_RECONNECT_PERIOD = 6.0       # как часто переподписываться при отсутствии кадров, с
+CAM_NOFRAME_WARN_AFTER = 10.0    # через сколько секунд без кадров считать подписку битой, с
+CAM_QOS_SCAN_AFTER = 30.0        # через сколько секунд начать перебор профилей/топиков, с
 
 
 # ──────────────────────────────────────────────
@@ -313,7 +332,13 @@ class QrDetector:
                         for name in ('down', 'front')}
         self.generation = 0
         self.received_at = {'down': 0.0, 'front': 0.0}
+        # Когда была создана текущая подписка камеры — нужно для диагностики
+        # «подписка жива, но кадров нет» (см. _camera_diagnostics).
+        self.subscribed_at = {'down': 0.0, 'front': 0.0}
         self.processed = {'down': 0, 'front': 0}
+        # Время (monotonic) последнего обработанного результата по камерам —
+        # для диагностики: кадры могут приходить, но обрабатываться с задержкой.
+        self.processed_at = {'down': 0.0, 'front': 0.0}
         self.decode_ms = {'down': 0.0, 'front': 0.0}
         self._candidate_jobs = {}
         self._candidate_sequences = {}
@@ -396,6 +421,7 @@ class QrDetector:
                 break
             name, job = result.camera, result.job
             self.processed[name] += 1
+            self.processed_at[name] = now
             self.decode_ms[name] = result.elapsed * 1000.0
             if job.generation != self.generation or now - job.captured_at > QR_RESULT_MAX_AGE:
                 continue
@@ -771,10 +797,27 @@ class RoomExplorer:
             return
         if self.fc.tilt > MAX_TILT_FOR_MAP:
             return
+        prev_xy = self.mapper.last_pose_xy
+        prev_yaw = self.mapper.last_yaw
         self.mapper.integrate(msg.ranges, msg.angle_min, msg.angle_increment,
                               msg.range_min, msg.range_max,
                               self.fc.current_pos[0], self.fc.current_pos[1],
                               self.fc.current_yaw)
+        # ── защита карты от «смешивания» при разворотах дрона ──
+        # LidarMapper._stabilize_yaw доворачивает сканы, полученные во время
+        # вращения на месте (позиция та же, yaw меняется), к прежнему
+        # стабильному yaw — стены комнаты остаются на своих местах, и в окне
+        # 'lidar_map' карта больше не перерисовывается «винтом» при каждом
+        # развороте. Здесь дополнительно: если дрон НЕ перемещался между
+        # сканами, трекер движения mapper'а не обновляем, чтобы фаза осмотра
+        # (GO_VIEWPOINT / SHAPE_SCAN) продолжала лететь по прежнему плану и
+        # не получала каждый цикл новую «мнимую» геометрию.
+        moved = (prev_xy is None or
+                 math.hypot(self.fc.current_pos[0] - prev_xy[0],
+                            self.fc.current_pos[1] - prev_xy[1]) >= 0.15)
+        if not moved and prev_yaw is not None:
+            self.mapper.last_pose_xy = prev_xy   # держим «дрон стоит на месте»
+            self.mapper.last_yaw = self.fc.current_yaw
 
     def _get_front_range(self) -> float:
         """Минимальная дальность лидара вперёд (±15°)."""
@@ -798,6 +841,7 @@ class RoomExplorer:
         self.target_vp = None
         self.qr_hold_until = 0.0
         self.reset_nav()
+        self.mapper.reset_motion_state()   # новая комната — трекер вращения заново
         self.is_scanning = True
         self.scan_complete = False
         self.hold_xy = (self.fc.current_pos[0], self.fc.current_pos[1])
@@ -1082,6 +1126,8 @@ class MissionStateMachine:
         self.door_pass_start: float = 0.0
         self.door_hover_start: float = 0.0
         self.room_qr_reset_at_crossing = False
+        # Время зависания после пролёта двери, с (можно уменьшить в тестах)
+        self.hover_after_door: float = HOVER_AFTER_DOOR
 
         # LAND_ON_PLATFORM (visual servoing)
         self.land_descend_z: float = 0.0
@@ -1318,8 +1364,38 @@ class MissionStateMachine:
                 self.land_descend_z = self.fc.scan_z
                 self.set_phase(MissionPhase.PRESTREAM)
             else:
-                self.node.get_logger().info(
-                    'Жду MAVROS, pose и лидар...', throttle_duration_sec=2.0)
+                now = time.monotonic()
+                if not hasattr(self, '_wait_since'):
+                    self._wait_since = now
+                    self._last_wait_log = 0.0
+                missing = []
+                if not self.fc.is_connected():
+                    missing.append('state(/uav1/mavros/state — нет сообщения или connected=False)')
+                if self.fc.pose is None:
+                    missing.append('pose(/uav1/mavros/local_position/pose)')
+                if self.explorer.scan is None:
+                    missing.append('scan(/uav1/scan)')
+                elapsed = now - self._wait_since
+                # Подробная диагностика раз в ~10 с, чтобы было видно, ЧЕГО именно нет
+                if (now - self._last_wait_log > 10.0
+                        or int(elapsed) in (30, 60, 120)):
+                    self._last_wait_log = now
+                    self.node.get_logger().warn(
+                        f'[WAIT] Не хватает {len(missing)} из 3 входов: '
+                        + '; '.join(missing) +
+                        f' | жду уже {elapsed:.0f} с. Проверьте: запущен ли mavros_node,'
+                        f' namespace {NS}, QoS BEST_EFFORT на state/pose/scan,'
+                        f' совпадает ли NS с реальным топиком (ros2 topic list)')
+                else:
+                    self.node.get_logger().info(
+                        'Жду MAVROS, pose и лидар...', throttle_duration_sec=2.0)
+                # Долгий ожидание = проблема конфигурации, а не случайная задержка
+                if elapsed > WAIT_TIMEOUT:
+                    self.node.get_logger().error(
+                        f'[WAIT] Таймаут ожидания сенсоров ({WAIT_TIMEOUT:.0f} с).'
+                        ' Миссия не может начаться: проверьте mavros/лидар/namespace.'
+                        ' Узел продолжает ждать (Ctrl+C для выхода).')
+                    self._wait_since = now  # не спамим ошибкой каждую секунду
             return
 
         # ── PRESTREAM ──
@@ -1514,7 +1590,7 @@ class MissionStateMachine:
                     f'{self.room_center[1]:.1f})')
 
             # Зависание после пролёта (отсчёт от момента commit)
-            if self.door_path_committed and now - self.door_hover_start > HOVER_AFTER_DOOR:
+            if self.door_path_committed and now - self.door_hover_start > self.hover_after_door:
                 self.set_phase(MissionPhase.VERIFY_NEW_ROOM)
             return
 
@@ -1624,6 +1700,140 @@ class MissionStateMachine:
 
 
 # ──────────────────────────────────────────────
+#  Класс: CameraLink (авто-восстановление подписок на камеры)
+# ──────────────────────────────────────────────
+
+def _camera_qos_profile(kind: str) -> QoSProfile:
+    """QoS-профили подписки на Image. ros_gz_bridge публикует кадры с
+    RELIABLE/VOLATILE — профиль 'reliable' совместим всегда; 'sensor'
+    (BEST_EFFORT) оставлен как запасной вариант."""
+    if kind == 'sensor':
+        return qos_profile_sensor_data
+    if kind == 'reliable_transient':
+        return QoSProfile(
+            depth=CAMERA_QOS_DEPTH,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+    return QoSProfile(
+        depth=CAMERA_QOS_DEPTH,
+        reliability=QoSReliabilityPolicy.RELIABLE,
+        durability=QoSDurabilityPolicy.VOLATILE)
+
+
+class CameraLink:
+    """
+    Надёжные подписки на камеры + автоматический ремонт.
+
+    Логирование вида «[CAM/down] Нет свежих кадров ... rx=0» означает, что к
+    callback'а on_image не приходит ни одного сообщения. Типовые причины:
+      1. Несовместимость QoS: ros_gz_bridge публикует Image RELIABLE/VOLATILE,
+         а подписка на qos_profile_sensor_data (BEST_EFFORT) в ряде сборок
+         Fast DDS не образует match — данные не доставляются вовсе.
+      2. Изменилось имя топика (другой launch/модель/namespace).
+      3. Bridge или Gazebo ещё не запущены / упали.
+
+    CameraLink при старте создаёт подписку с профилем 'reliable' на первый
+    кандидат-топик. Если в течение CAM_NOFRAME_WARN_AFTER секунд кадров нет,
+    подписка пересоздаётся: перебираются профили (reliable -> sensor ->
+    reliable_transient), затем остальные топики-кандидаты, и цикл повторяется.
+    Как только кадры появляются, текущая конфигурация фиксируется и больше не
+    меняется.
+    """
+
+    def __init__(self, node: Node, qr: 'QrDetector'):
+        self.node = node
+        self.qr = qr
+        self.subs: Dict[str, object] = {}
+        self.topic_idx: Dict[str, int] = {'down': 0, 'front': 0}
+        self.qos_idx: Dict[str, int] = {'down': 0, 'front': 0}
+        self.nframes_at_check: Dict[str, int] = {'down': 0, 'front': 0}
+        self.locked: Dict[str, bool] = {'down': False, 'front': False}
+        self.last_switch: Dict[str, float] = {'down': 0.0, 'front': 0.0}
+        self._scan_started: Dict[str, float] = {'down': 0.0, 'front': 0.0}
+        for name in ('down', 'front'):
+            self.subscribe(name)
+
+    #── подписки ──
+
+    def current_topic(self, name: str) -> str:
+        return CAMERA_TOPICS[name][self.topic_idx[name] % len(CAMERA_TOPICS[name])]
+
+    def current_qos_kind(self, name: str) -> str:
+        return CAMERA_QOS_PROFILES[self.qos_idx[name] % len(CAMERA_QOS_PROFILES)]
+
+    def subscribe(self, name: str):
+        topic = self.current_topic(name)
+        kind = self.current_qos_kind(name)
+        qos = _camera_qos_profile(kind)
+        old = self.subs.pop(name, None)
+        if old is not None:
+            try:
+                self.node.destroy_subscription(old)
+            except Exception as exc:  # узел может уничтожаться — не критично
+                self.node.get_logger().debug(f'destroy sub {name}: {exc}')
+        cb = (lambda msg, n=name: self.on_frame(n, msg))
+        self.subs[name] = self.node.create_subscription(Image, topic, cb, qos)
+        now = time.monotonic()
+        self.qr.subscribed_at[name] = now
+        self.qr.received_at[name] = 0.0
+        self.nframes_at_check[name] = self.qr.nframes[name]
+        self.last_switch[name] = now
+        self._scan_started[name] = now
+        self.node.get_logger().info(
+            f'[CAM/{name}] Подписка: topic={topic} qos={kind} '
+            f'(depth={CAMERA_QOS_DEPTH})')
+
+    def on_frame(self, name: str, msg: Image):
+        was_locked = self.locked[name]
+        self.qr.on_image(name, msg)
+        if not was_locked and self.qr.nframes[name] > self.nframes_at_check[name]:
+            # Кадры пошли — фиксируем успешную конфигурацию.
+            self.locked[name] = True
+            self.node.get_logger().info(
+                f'[CAM/{name}] Кадры получают: topic={self.current_topic(name)} '
+                f'qos={self.current_qos_kind(name)}')
+
+    #── авто-ремонт ──
+
+    def update(self):
+        """Периодическая проверка: если кадров нет — меняем QoS/топик."""
+        now = time.monotonic()
+        for name in ('down', 'front'):
+            if self.locked[name]:
+                continue
+            got_frames = self.qr.nframes[name] > self.nframes_at_check[name]
+            if got_frames:
+                self.locked[name] = True
+                continue
+            age = now - self.last_switch[name]
+            if age < CAM_NOFRAME_WARN_AFTER:
+                continue
+            if age < CAM_RECONNECT_PERIOD:
+                continue
+            self._advance(name)
+            self.subscribe(name)
+            self.node.get_logger().warn(
+                f'[CAM/{name}] Кадры не приходят {age:.0f} с — пробую '
+                f'topic={self.current_topic(name)} qos={self.current_qos_kind(name)}. '
+                f'Проверьте, что gz bridge запущен и публикует Image '
+                f'(ros2 topic info {self.current_topic(name)} -v).')
+
+    def _advance(self, name: str):
+        """Следующая комбинация (топик, QoS): сначала профили, потом топики."""
+        topics = CAMERA_TOPICS[name]
+        self.qos_idx[name] += 1
+        if self.qos_idx[name] >= len(CAMERA_QOS_PROFILES):
+            self.qos_idx[name] = 0
+            self.topic_idx[name] += 1
+        self.topic_idx[name] %= len(topics)
+        # После полного цикла кандидатов увеличиваем интервал перебора,
+        # чтобы не спамить логами, если источник действительно мёртв.
+        elapsed = time.monotonic() - self._scan_started[name]
+        if elapsed > CAM_QOS_SCAN_AFTER * 5:
+            pass  # просто продолжаем редкие попытки
+
+
+# ──────────────────────────────────────────────
 #  Главный узел
 # ──────────────────────────────────────────────
 
@@ -1650,10 +1860,12 @@ class DroneMissionNode(Node):
                                  self._on_rangefinder, q)
         self.create_subscription(Imu, f'{NS}/mavros/imu/data',
                                  self._on_imu, q)
-        self.create_subscription(Image, f'{NS}/camera_down',
-                                 lambda m: self.qr.on_image('down', m), q)
-        self.create_subscription(Image, f'{NS}/camera',
-                                 lambda m: self.qr.on_image('front', m), q)
+        # Камеры: НЕ используем qos_profile_sensor_data — ros_gz_bridge
+        # публикует Image с RELIABLE/VOLATILE, и на некоторых сборках
+        # Fast DDS такая пара не сходится: кадры не доходят вообще (rx=0).
+        # Подписки создаёт CameraLink, который сам перебирает QoS-профили и
+        # имена топиков, пока не появятся кадры.
+        self.camera_link = CameraLink(self, self.qr)
 
         self.rangefinder: Optional[Range] = None
         self.imu: Optional[Imu] = None
@@ -1665,6 +1877,7 @@ class DroneMissionNode(Node):
         if SHOW_WINDOWS:
             self.create_timer(0.1, self._show_cameras)
         self.create_timer(2.0, self._camera_diagnostics)
+        self.create_timer(CAM_RECONNECT_PERIOD, self.camera_link.update)
 
         self.get_logger().info(
             'DroneMissionNode запущен. Ожидание MAVROS...')
@@ -1693,15 +1906,44 @@ class DroneMissionNode(Node):
     def _camera_diagnostics(self):
         now = time.monotonic()
         for name in ('down', 'front'):
+            worker = self.qr.workers[name]
             received = self.qr.received_at[name]
-            age = now - received if received else float('inf')
+            # Возраст считается по последнему ОБРАБОТАННОМУ кадру: пока worker
+            # ещё декодирует предыдущий кадр, новые кадры уже принимаются.
+            processed_age = (now - self.qr.processed_at[name]
+                             if self.qr.processed_at[name] else float('inf'))
+            rx_age = now - received if received else float('inf')
+            pending = worker.pending.qsize() + worker.inflight
+            link = getattr(self, 'camera_link', None)
+            cfg = ''
+            if link is not None:
+                cfg = (f' topic={link.current_topic(name)}'
+                       f' qos={link.current_qos_kind(name)}'
+                       f' {"OK" if link.locked[name] else "нет кадров"}')
             self.get_logger().info(
-                f'[CAM/{name}] rx={self.qr.nframes[name]} '
+                f'[CAM/{name}] rx={self.qr.nframes[name]}{cfg} '
                 f'processed={self.qr.processed[name]} decode={self.qr.decode_ms[name]:.0f}ms '
-                f'age={age:.2f}s replaced={self.qr.workers[name].dropped}')
-            if age > 1.0:
+                f'age={processed_age:.2f}s replaced={worker.dropped} pending={pending}')
+
+            # Проверяем здоровье конвейера по возрaсту ОБРАБОТКИ, а не получения.
+            # Если кадры приходят, но не обрабатываются — это проблема с CPU/decoder.
+            # Если кадры вообще не приходят — проблема с topic/bridge/QoS.
+            if rx_age > 3.0 and processed_age > 3.0:
+                # Длительное отсутствие кадров на входе И в обработке.
+                hint = ''
+                if link is not None and not link.locked[name]:
+                    hint = (' — CameraLink автоматически перебирает QoS/топики;'
+                            ' проверьте, что gz bridge запущен и публикует Image:'
+                            f' ros2 topic info {link.current_topic(name)} -v')
                 self.get_logger().warn(
-                    f'[CAM/{name}] Нет свежих кадров: проверьте camera topic/bridge/QoS')
+                    f'[CAM/{name}] Нет свежих кадров: проверьте camera '
+                    f'topic/bridge/QoS{hint}')
+            elif processed_age > max(2.5, 4.0 * self.qr.decode_ms[name] / 1000.0):
+                # Кадры приходят регулярно, но конвейер не успевает их обрабатывать.
+                self.get_logger().warn(
+                    f'[CAM/{name}] Конвейер QR отстаёт: decode='
+                    f'{self.qr.decode_ms[name]:.0f}ms при rx_age={rx_age:.2f}s; '
+                    f'проверьте загрузку CPU / уменьшите разрешение камеры')
 
     def _show_lidar(self):
         """Отдельное окно: карта лидара, стены, углы, проёмы, точки осмотра."""
@@ -1742,13 +1984,28 @@ def main():
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Прерывание пользователем')
-        node.fc.land()
-        rclpy.spin_once(node, timeout_sec=0.5)
+        # При Ctrl+C контекст может быть уже невалидным для публикации логов.
+        # Используем print вместо logger, чтобы избежать ошибки.
+        print('[drone_mission] Прерывание пользователем (Ctrl+C)')
+        try:
+            node.fc.land()
+        except Exception as e:
+            print(f'[drone_mission] Ошибка при посадке: {e}')
+        # Даем немного времени на обработку последних setpoint'ов
+        try:
+            rclpy.spin_once(node, timeout_sec=0.3)
+        except Exception:
+            pass
     finally:
-        node.shutdown()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            node.shutdown()
+        except Exception as e:
+            print(f'[drone_mission] Ошибка при shutdown: {e}')
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

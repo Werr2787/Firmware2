@@ -84,6 +84,11 @@ class CameraWorker:
         self.stop_event = Event()
         self.decoder = decoder
         self.dropped = 0
+        # Number of jobs currently being decoded by the worker thread.
+        # Kept as an attribute (not a local) so diagnostics can tell whether
+        # the pipeline is back-pressured instead of starved by the topic.
+        self.inflight = 0
+        self.last_finished_at = None  # monotonic time of the last result produced
         self.thread = Thread(target=self._run, name=f"qr-{camera}", daemon=True)
         self.thread.start()
 
@@ -92,10 +97,18 @@ class CameraWorker:
             self.pending.put_nowait(job)
         except Full:
             try:
-                self.pending.get_nowait()
+                stale = self.pending.get_nowait()
                 self.dropped += 1
             except Empty:
-                pass
+                stale = None
+            # Keep the newest frame: replace the pending job only if the
+            # incoming one was captured later than the queued one.
+            if stale is not None and job.captured_at <= stale.captured_at:
+                try:
+                    self.pending.put_nowait(stale)
+                except Full:
+                    self.dropped += 1
+                return
             try:
                 self.pending.put_nowait(job)
             except Full:
@@ -109,24 +122,46 @@ class CameraWorker:
             except Empty:
                 continue
             start = time.monotonic()
+            self.inflight = 1
             try:
-                decoded, outlines = decoder.decode(job.frame)
-                error = ""
-            except Exception as exc:
-                decoded, outlines, error = [], [], str(exc)
-            result = DecodeResult(self.camera, job, decoded, outlines,
-                                  time.monotonic(), time.monotonic() - start, error)
-            try:
-                self.output.put_nowait(result)
-            except Full:
                 try:
-                    self.output.get_nowait()
-                except Empty:
-                    pass
+                    decoded, outlines = decoder.decode(job.frame)
+                    error = ""
+                except Exception as exc:
+                    decoded, outlines, error = [], [], str(exc)
+                result = DecodeResult(self.camera, job, decoded, outlines,
+                                      time.monotonic(), time.monotonic() - start, error)
+                self.last_finished_at = result.finished_at
+                # Output queue holds per-camera results; drop the oldest one
+                # for THIS camera only, so we never lose another camera's data.
+                if self.output.full():
+                    self._drain_own_results()
                 try:
                     self.output.put_nowait(result)
                 except Full:
                     pass
+            finally:
+                self.inflight = 0
+
+    def _drain_own_results(self):
+        """Remove this camera's stale results from the shared output queue."""
+        kept = []
+        drained_any = False
+        while True:
+            try:
+                item = self.output.get_nowait()
+            except Empty:
+                break
+            if isinstance(item, DecodeResult) and item.camera == self.camera:
+                drained_any = True
+            else:
+                kept.append(item)
+        for item in kept:
+            try:
+                self.output.put_nowait(item)
+            except Full:
+                break
+        return drained_any
 
     def close(self):
         self.stop_event.set()

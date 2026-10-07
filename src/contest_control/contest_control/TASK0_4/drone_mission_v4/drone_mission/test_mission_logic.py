@@ -41,10 +41,11 @@ module('rclpy.node', Node=Node)
 
 
 class _QoSProfile:
-    def __init__(self, depth=0, reliability=None, durability=None):
+    def __init__(self, depth=0, reliability=None, durability=None, history=None):
         self.depth = depth
         self.reliability = reliability
         self.durability = durability
+        self.history = history
 
 
 module('rclpy.qos',
@@ -53,7 +54,9 @@ module('rclpy.qos',
        QoSDurabilityPolicy=type('QoSDurabilityPolicy', (),
                                 {'VOLATILE': 0, 'TRANSIENT_LOCAL': 1}),
        QoSReliabilityPolicy=type('QoSReliabilityPolicy', (),
-                                 {'RELIABLE': 1, 'BEST_EFFORT': 2}))
+                                 {'RELIABLE': 1, 'BEST_EFFORT': 2}),
+       QoSHistoryPolicy=type('QoSHistoryPolicy', (),
+                             {'KEEP_LAST': 1, 'KEEP_ALL': 2}))
 for package, names in (
         ('geometry_msgs', ['PoseStamped']),
         ('sensor_msgs', ['Image', 'Imu', 'LaserScan', 'Range']),

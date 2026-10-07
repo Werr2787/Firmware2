@@ -32,11 +32,28 @@ class Node:
     def get_logger(self): return Log()
     def create_publisher(self, *a): return types.SimpleNamespace(publish=lambda x: None)
     def create_client(self, *a): return types.SimpleNamespace(service_is_ready=lambda: False)
+    def create_subscription(self, *a): return types.SimpleNamespace(topic=a[1])
+    def destroy_subscription(self, sub): pass
 
 
 module('rclpy')
 module('rclpy.node', Node=Node)
-module('rclpy.qos', qos_profile_sensor_data=None)
+
+
+class _QoSProfile:
+    def __init__(self, depth=0, reliability=None, durability=None):
+        self.depth = depth
+        self.reliability = reliability
+        self.durability = durability
+
+
+module('rclpy.qos',
+       qos_profile_sensor_data=_QoSProfile(depth=2),
+       QoSProfile=_QoSProfile,
+       QoSDurabilityPolicy=type('QoSDurabilityPolicy', (),
+                                {'VOLATILE': 0, 'TRANSIENT_LOCAL': 1}),
+       QoSReliabilityPolicy=type('QoSReliabilityPolicy', (),
+                                 {'RELIABLE': 1, 'BEST_EFFORT': 2}))
 for package, names in (
         ('geometry_msgs', ['PoseStamped']),
         ('sensor_msgs', ['Image', 'Imu', 'LaserScan', 'Range']),
@@ -194,7 +211,12 @@ class TestPlatformSelection(unittest.TestCase):
 
 
 class TestFullMissionSmoke(unittest.TestCase):
-    """End-to-end FSM: WAIT -> ... -> landing on the matching platform."""
+    """End-to-end FSM: WAIT -> ... -> landing on the matching platform.
+
+    Time is virtualised (patched time.monotonic), so real-time gates inside
+    phases (hover after door, AUTO.LAND confirmation) advance with simulated
+    dt instead of wall-clock seconds.
+    """
 
     def test_flow_to_auto_land(self):
         node = Node()
@@ -212,6 +234,11 @@ class TestFullMissionSmoke(unittest.TestCase):
         ex.scan = types.SimpleNamespace(
             ranges=[5.0] * n, angle_min=-np.pi,
             angle_increment=2 * np.pi / n, range_min=0.1, range_max=30.0)
+
+        sim_now = [time.monotonic()]
+
+        def fake_monotonic():
+            return sim_now[0]
 
         phases_seen = set()
 
@@ -238,14 +265,15 @@ class TestFullMissionSmoke(unittest.TestCase):
             # teleport: arrival shortcuts everywhere
             if fc.has_target:
                 fc.current_pos = tuple(fc.target_pos)
+            # advance virtual clock AFTER the step (arrival uses current time)
+            sim_now[0] += dt
 
         with patch.object(fc, 'send_setpoint'), \
              patch.object(ex, 'update', return_value='complete'), \
              patch.object(ex, 'navigate_to',
-                          side_effect=lambda g, z=None, face=True: 'arrived'):
-            # PASS_DOOR has a real-time hover (HOVER_AFTER_DOOR); shorten it
-            ms.hover_after_door = 0.05
-            for _ in range(2000):
+                          side_effect=lambda g, z=None, face=True: 'arrived'), \
+             patch('autonomous_drone_mission.time.monotonic', fake_monotonic):
+            for _ in range(4000):
                 step(0.05)
                 if ms.phase in (A.MissionPhase.AUTO_LAND,
                                 A.MissionPhase.FAILSAFE_LAND):
@@ -259,6 +287,66 @@ class TestFullMissionSmoke(unittest.TestCase):
         self.assertIsNotNone(ms.selected_platform)
         self.assertTrue(A.platform_matches(ms.path_array,
                                            ms.selected_platform.raw_text))
+        qr.close()
+
+
+class TestCameraLink(unittest.TestCase):
+    """Авто-восстановление подписок на камеры (проблема rx=0 / QoS mismatch)."""
+
+    def _make_link(self, node=None):
+        node = node or Node()
+        qr = A.QrDetector(node)
+        link = A.CameraLink(node, qr)
+        return node, qr, link
+
+    def test_starts_with_reliable_qos_and_primary_topic(self):
+        _, _, link = self._make_link()
+        for name in ('down', 'front'):
+            self.assertEqual(link.current_qos_kind(name), 'reliable')
+            self.assertEqual(link.current_topic(name),
+                             A.CAMERA_TOPICS[name][0])
+        link.qr.close()
+
+    def test_frame_locks_configuration(self):
+        class Frame:
+            encoding = 'bgr8'
+            height = 4
+            width = 4
+            step = 12
+            data = bytes(4 * 12)
+
+        node, qr, link = self._make_link()
+        # Имитируем приход одного кадра через callback подписки.
+        link.on_frame('down', Frame())
+        self.assertTrue(link.locked['down'])
+        self.assertEqual(qr.nframes['down'], 1)
+        # После фиксации update() больше не меняет конфигурацию.
+        topic_before = link.current_topic('down')
+        with patch('time.monotonic', return_value=time.monotonic() + 3600):
+            link.update()
+        self.assertEqual(link.current_topic('down'), topic_before)
+        qr.close()
+
+    def test_update_cycles_qos_then_topics_when_no_frames(self):
+        node, qr, link = self._make_link()
+        base = time.monotonic()
+        seq_qos, seq_topic = [], []
+        with patch('time.monotonic', side_effect=lambda: base) as tmon:
+            for _ in range(len(A.CAMERA_QOS_PROFILES)):
+                base += A.CAM_NOFRAME_WARN_AFTER + 1.0
+                link.update()
+                seq_qos.append(link.current_qos_kind('down'))
+            for _ in range(len(A.CAMERA_TOPICS['down']) - 1):
+                base += A.CAM_NOFRAME_WARN_AFTER + 1.0
+                link.update()
+                seq_topic.append(link.current_topic('down'))
+        # Профили перебираются по кругу: reliable -> sensor -> transient -> ...
+        self.assertEqual(seq_qos[0], 'sensor')
+        self.assertEqual(seq_qos[1], 'reliable_transient')
+        self.assertEqual(seq_qos[2], 'reliable')
+        # Затем начинается перебор топиков-кандидатов.
+        self.assertEqual(seq_topic[0], A.CAMERA_TOPICS['down'][1])
+        qr.close()
 
 
 if __name__ == '__main__':
